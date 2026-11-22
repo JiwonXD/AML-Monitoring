@@ -1,0 +1,433 @@
+package com.moneylaundry.api.analysis;
+
+import java.sql.Connection;
+import java.sql.SQLException;
+import java.sql.Timestamp;
+import java.time.Instant;
+import java.util.*;
+import org.springframework.dao.DataAccessException;
+import org.springframework.stereotype.Component;
+
+/** 일별 분석 실행기. 전역 advisory lock을 가진 인스턴스만 대기 작업을 단계별로 실행하고 실패 기록·재시도 예약·완료 공개를 처리한다. */
+@Component
+public class AnalysisRunner implements AutoCloseable {
+  private final AnalysisService service;
+  private final AnalysisStageExecutor executor;
+  private final UUID owner = UUID.randomUUID();
+  private final Map<Long, Pending> pending = new HashMap<>();
+  private Connection leadership;
+  private final AnalysisRunService runs;
+
+  private record Failure(
+      UUID id,
+      String code,
+      AnalysisFailure.Kind kind,
+      Instant at,
+      int count,
+      Instant retryAt,
+      boolean terminal) {}
+
+  private static final class Pending {
+    final AnalysisService.Job job;
+    AnalysisStageExecutor.Context context;
+    AnalysisStageExecutor.Result result;
+    Instant nextFlushAt;
+    boolean deferred;
+    final List<Failure> failures = new ArrayList<>();
+
+    Pending(AnalysisService.Job job) {
+      this.job = job;
+    }
+  }
+
+  @org.springframework.beans.factory.annotation.Autowired
+  public AnalysisRunner(
+      AnalysisService service, AnalysisStageExecutor executor, AnalysisRunService runs) {
+    this.service = service;
+    this.executor = executor;
+    this.runs = Objects.requireNonNull(runs);
+  }
+
+  public synchronized void recover() {
+    withExecutionLock(this::recoverOwned);
+  }
+
+  private void recoverOwned() {
+    try {
+      service.jdbc.update(
+          """
+          update analysis.jobs set status='QUEUED',execution_id=null,execution_owner=null
+          where status='RUNNING' and execution_owner is distinct from ?
+          """,
+          owner);
+    } catch (DataAccessException ignored) {
+      /* Next scan retries recovery; no missing-date registration. */
+    }
+  }
+
+  public synchronized void scan() {
+    withExecutionLock(this::scanOwned);
+  }
+
+  private void withExecutionLock(Runnable action) {
+    try {
+      if (leadership != null && !leadership.isValid(1)) close();
+      if (leadership == null) {
+        Connection candidate = service.jdbc.getDataSource().getConnection();
+        try (var statement = candidate.createStatement();
+            var result = statement.executeQuery("select pg_try_advisory_lock(17002002)")) {
+          result.next();
+          if (result.getBoolean(1)) leadership = candidate;
+        } finally {
+          if (leadership != candidate) candidate.close();
+        }
+      }
+      if (leadership != null) action.run();
+    } catch (SQLException | DataAccessException ignored) {
+      /* No ownership acquired: do not start a second execution. */
+    }
+  }
+
+  @Override
+  @jakarta.annotation.PreDestroy
+  public synchronized void close() {
+    if (leadership == null) return;
+    try (var statement = leadership.createStatement()) {
+      statement.execute("select pg_advisory_unlock(17002002)");
+    } catch (SQLException ignored) {
+      /* A lost session has already released its lock. */
+    } finally {
+      try {
+        leadership.close();
+      } catch (SQLException ignored) {
+      }
+      leadership = null;
+    }
+  }
+
+  private void scanOwned() {
+    recoverOwned();
+    Set<Long> flushed = new HashSet<>(pending.keySet());
+    for (Pending item : List.copyOf(pending.values())) flush(item);
+    try {
+      var ids =
+          service.jdbc.queryForList(
+              """
+              select job_id from analysis.jobs where
+              (status='QUEUED' or (status='RETRY_WAIT' and retry_at<=?)) order by job_id
+              """,
+              Long.class,
+              Timestamp.from(service.clock.instant()));
+      for (long id : ids) if (!pending.containsKey(id) && !flushed.contains(id)) run(id);
+    } catch (DataAccessException ignored) {
+      /* State is retained; scan is not an execution attempt. */
+    }
+  }
+
+  private void run(long id) {
+    Pending item;
+    try {
+      item =
+          service.tx.execute(
+              status -> {
+                service.lock(id);
+                var job = service.job(id);
+                if (!job.status().equals("QUEUED")
+                    && !(job.status().equals("RETRY_WAIT")
+                        && job.retryAt() != null
+                        && !job.retryAt().isAfter(service.clock.instant()))) return null;
+                service.jdbc.update(
+                    "update analysis.jobs set started_at=coalesce(started_at,?) where job_id=?",
+                    Timestamp.from(service.businessNow()),
+                    id);
+                if (job.stage() == AnalysisStage.WAIT_INGEST) {
+                  waitForIngest(id);
+                  return null;
+                }
+                if (job.stage() == AnalysisStage.INFERENCE
+                    && runs.current(id) != null
+                    && !runs.canInfer(runs.current(id))) return null;
+                UUID token = UUID.randomUUID();
+                service.jdbc.update(
+                    """
+                    update analysis.jobs set status='RUNNING',attempt_count=attempt_count+1,
+                    stage_attempt_count=stage_attempt_count+1,execution_id=?,execution_owner=?,retry_at=null,
+                    started_at=coalesce(started_at,?) where job_id=?
+                    """,
+                    token,
+                    owner,
+                    Timestamp.from(service.businessNow()),
+                    id);
+                return new Pending(service.job(id));
+              });
+      if (item == null) return;
+    } catch (DataAccessException ignored) {
+      return;
+    }
+    pending.put(id, item);
+    try {
+      var uploads =
+          service.jdbc.queryForList(
+              "select a.upload_id from analysis.receipts a join ingest.uploads u using(upload_id) where a.job_id=? and u.status='COMPLETED' order by a.upload_id",
+              Long.class,
+              id);
+      Map<String, String> artifacts = new LinkedHashMap<>();
+      service.jdbc.query(
+          "select stage,artifact from analysis.stage_results where job_id=? and completed",
+          rs -> {
+            artifacts.put(rs.getString(1), rs.getString(2));
+          },
+          id);
+      UUID currentRun = runs.current(id);
+      item.context =
+          new AnalysisStageExecutor.Context(
+              id, item.job.stage(), item.job.executionId(), uploads, artifacts, currentRun);
+      var saved =
+          service.jdbc.queryForList(
+              "select artifact from analysis.stage_results where job_id=? and stage=? and not"
+                  + " completed",
+              String.class,
+              id,
+              item.job.stage().name());
+      item.result =
+          saved.isEmpty()
+              ? item.job.stage() == AnalysisStage.FREEZE_INPUT
+                  ? new AnalysisStageExecutor.Result("internal")
+                  : executor.prepare(item.context)
+              : new AnalysisStageExecutor.Result(saved.getFirst());
+    } catch (AnalysisDeferred waiting) {
+      item.deferred = true;
+    } catch (AnalysisFailure failure) {
+      addFailure(item, failure.code(), failure.kind());
+    } catch (DataAccessException failure) {
+      addFailure(item, "DB_UNAVAILABLE", AnalysisFailure.Kind.CONNECTION);
+    } catch (RuntimeException failure) {
+      addFailure(item, "STAGE_EXECUTION_FAILED", AnalysisFailure.Kind.COMPUTATION);
+    }
+    flush(item);
+  }
+
+  /** Moves a WAIT_INGEST job to FAILED, RETRY_WAIT or the INTEGRATE stage; never executes it. */
+  private void waitForIngest(long id) {
+    var states =
+        service.jdbc.queryForList(
+            "select u.status from analysis.receipts a join ingest.uploads u using(upload_id) where a.job_id=?",
+            String.class,
+            id);
+    if (states.contains("FAILED")) {
+      service.jdbc.update(
+          "update analysis.jobs set status='FAILED',error_code='INGEST_FAILED',error_message='대상 파일 적재"
+              + " 오류를 조치한 뒤 재개하세요.',finished_at=? where job_id=?",
+          Timestamp.from(service.businessNow()),
+          id);
+      return;
+    }
+    if (states.stream().anyMatch(s -> !s.equals("COMPLETED") && !s.equals("VALIDATION_FAILED"))) {
+      service.jdbc.update(
+          "update analysis.jobs set status='RETRY_WAIT',retry_at=? where job_id=?",
+          Timestamp.from(service.clock.instant().plusSeconds(5)),
+          id);
+      return;
+    }
+    service.jdbc.update(
+        "update analysis.jobs set status='QUEUED',current_stage='INTEGRATE',retry_at=null where job_id=?",
+        id);
+  }
+
+  private void addFailure(Pending item, String code, AnalysisFailure.Kind kind) {
+    Failure previous = item.failures.isEmpty() ? null : item.failures.getLast();
+    String priorCode = previous == null ? item.job.error() : previous.code();
+    int priorCount = previous == null ? item.job.failures() : previous.count();
+    int count = code.equals(priorCode) ? priorCount + 1 : 1;
+    boolean terminal = kind == AnalysisFailure.Kind.PERMANENT || count >= 3;
+    // The backoff runs on the real clock; the recorded failure time is business time.
+    Instant now = service.clock.instant();
+    long delay =
+        kind == AnalysisFailure.Kind.CONNECTION ? (count == 1 ? 30 : 120) : (count == 1 ? 60 : 300);
+    item.failures.add(
+        new Failure(
+            UUID.randomUUID(),
+            code,
+            kind,
+            service.businessNow(),
+            count,
+            terminal ? null : now.plusSeconds(delay),
+            terminal));
+  }
+
+  private void flush(Pending item) {
+    Failure last = item.failures.isEmpty() ? null : item.failures.getLast();
+    if (item.nextFlushAt != null && item.nextFlushAt.isAfter(service.clock.instant())) return;
+    try {
+      service.tx.executeWithoutResult(
+          status -> {
+            AnalysisRunService.integrationLock(service.jdbc);
+            service.jdbc.queryForList(
+                "select pg_advisory_xact_lock(?)", AnalysisService.RECEIPT_LOCK);
+            service.jdbc.queryForList("select id from ops.business_clock where id for update");
+            service.lock(item.job.id());
+            if (!service.owns(item.job)) return;
+            if (item.deferred) {
+              service.jdbc.update(
+                  """
+                  update analysis.jobs set status='RETRY_WAIT',retry_at=?,execution_id=null,
+                    execution_owner=null where job_id=?
+                  """,
+                  Timestamp.from(service.clock.instant().plusSeconds(5)),
+                  item.job.id());
+              return;
+            }
+            for (Failure failure : item.failures)
+              service.jdbc.update(
+                  """
+                  insert into analysis.failures(failure_id,job_id,stage,execution_id,error_code,failed_at,consecutive_count,retry_at,action_required)
+                  values(?,?,?,?,?,?,?,?,?) on conflict(failure_id) do nothing
+                  """,
+                  failure.id(),
+                  item.job.id(),
+                  item.job.stage().name(),
+                  item.job.executionId(),
+                  failure.code(),
+                  Timestamp.from(failure.at()),
+                  failure.count(),
+                  failure.retryAt() == null ? null : Timestamp.from(failure.retryAt()),
+                  failure.terminal());
+            if (last != null
+                && (item.result == null
+                    || last.terminal()
+                    || last.kind() != AnalysisFailure.Kind.CONNECTION)) {
+              if (item.result != null)
+                service.jdbc.update(
+                    "insert into"
+                        + " analysis.stage_results(job_id,run_id,stage,execution_id,artifact,completed)"
+                        + " values(?,?,?,?,?,false) on conflict(job_id,stage) do nothing",
+                    item.job.id(),
+                    item.context.runId(),
+                    item.job.stage().name(),
+                    item.job.executionId(),
+                    item.result.artifact());
+              service.jdbc.update(
+                  "update analysis.jobs set status=?,error_code=?,error_message='분석 단계 처리에"
+                      + " 실패했습니다.',consecutive_failures=?,retry_at=?,finished_at=? where job_id=?",
+                  last.terminal() ? "FAILED" : "RETRY_WAIT",
+                  last.code(),
+                  last.count(),
+                  last.retryAt() == null ? null : Timestamp.from(last.retryAt()),
+                  last.terminal() ? Timestamp.from(last.at()) : null,
+                  item.job.id());
+              return;
+            }
+            if (item.job.stage() == AnalysisStage.FREEZE_INPUT) {
+              Instant cutoff =
+                  service
+                      .jdbc
+                      .queryForObject(
+                          "select analysis_cutoff_at from analysis.jobs where job_id=?",
+                          Timestamp.class,
+                          item.job.id())
+                      .toInstant();
+              UUID run = runs.freeze(item.job.id(), cutoff);
+              runs.refreshInputStatistics();
+              // FREEZE_INPUT stored the run's TARGET count with the run, in the same transaction.
+              int count =
+                  service.jdbc.queryForObject(
+                      "select row_count from analysis.jobs where job_id=?",
+                      Integer.class,
+                      item.job.id());
+              boolean backfill =
+                  "BACKFILL"
+                      .equals(
+                          service.jdbc.queryForObject(
+                              "select completion_reason from analysis.jobs where job_id=?",
+                              String.class,
+                              item.job.id()));
+              if (count == 0 || backfill) {
+                if (!backfill
+                    && service.jdbc.queryForObject(
+                        "select exists(select 1 from analysis.run_alert_origins where run_id=?) or exists(select 1 from analysis.run_scores where run_id=?)",
+                        Boolean.class,
+                        run,
+                        run)) {
+                  service.jdbc.update(
+                      "update analysis.jobs set status='QUEUED',current_stage='ALERTS',row_count=0,suspicious_tx_count=0,execution_id=null,execution_owner=null,stage_attempt_count=0 where job_id=?",
+                      item.job.id());
+                  return;
+                }
+                // A completed run's TARGETs are never selected again; a backfill run's stay
+                // history (CONTEXT) for later analyses without ever being scored.
+                runs.complete(run);
+                service.jdbc.update(
+                    "update analysis.jobs set status='COMPLETED',current_stage='COMPLETE',completion_reason=?,row_count=?,suspicious_tx_count=0,alert_count=0,finished_at=?,execution_id=null,execution_owner=null where job_id=?",
+                    backfill ? "BACKFILL" : "EMPTY_INPUT",
+                    count,
+                    Timestamp.from(service.businessNow()),
+                    item.job.id());
+                runs.refreshQueryStatistics();
+                return;
+              }
+            } else executor.commit(item.context, item.result);
+            service.jdbc.update(
+                "insert into analysis.stage_results(job_id,run_id,stage,execution_id,artifact,completed) values(?,?,?,?,?,true) on conflict(job_id,stage) do update set completed=true,execution_id=excluded.execution_id,run_id=excluded.run_id",
+                item.job.id(),
+                runs.current(item.job.id()),
+                item.job.stage().name(),
+                item.job.executionId(),
+                item.result.artifact());
+            boolean complete = item.job.stage() == AnalysisStage.ALERTS;
+            if (complete && item.context.runId() != null) {
+              new com.moneylaundry.api.analysis.publish.AlertPublisher(service.jdbc)
+                  .publish(item.context.runId(), item.job.executionId(), item.result.artifact());
+              runs.complete(item.context.runId());
+            }
+            service.jdbc.update(
+                "update analysis.jobs set"
+                    + " status=?,current_stage=?,stage_attempt_count=0,consecutive_failures=0,error_code=null,error_message=null,retry_at=null,execution_id=null,execution_owner=null,finished_at=?"
+                    + " where job_id=?",
+                complete ? "COMPLETED" : "QUEUED",
+                item.job.stage().next().name(),
+                complete ? Timestamp.from(service.businessNow()) : null,
+                item.job.id());
+            if (complete) runs.refreshQueryStatistics();
+          });
+      pending.remove(item.job.id());
+    } catch (DataAccessException failure) {
+      if (last == null || !last.terminal()) {
+        addFailure(item, "DB_UNAVAILABLE", AnalysisFailure.Kind.CONNECTION);
+        item.nextFlushAt = item.failures.getLast().retryAt();
+      }
+    } catch (AnalysisFailure failure) {
+      addFailure(item, failure.code(), failure.kind());
+    } catch (RuntimeException failure) {
+      if ("ALERT_BASELINE_CHANGED".equals(failure.getMessage())) {
+        service.tx.executeWithoutResult(
+            s -> {
+              service.lock(item.job.id());
+              if (service.owns(item.job))
+                service.jdbc.update(
+                    "delete from analysis.stage_results where run_id=? and stage='ALERTS'",
+                    item.context.runId());
+            });
+        item.result = null;
+        addFailure(item, "ALERT_BASELINE_CHANGED", AnalysisFailure.Kind.COMPUTATION);
+      } else if ("INPUT_REVISION_CHANGED".equals(failure.getMessage())) {
+        service.tx.executeWithoutResult(
+            status -> {
+              service.lock(item.job.id());
+              if (service.owns(item.job))
+                service.jdbc.update(
+                    "update analysis.jobs set status='QUEUED',current_stage='INTEGRATE',execution_id=null,execution_owner=null where job_id=?",
+                    item.job.id());
+            });
+        pending.remove(item.job.id());
+      } else
+        addFailure(
+            item,
+            "CUTOFF_SUPERSEDED".equals(failure.getMessage())
+                ? "CUTOFF_SUPERSEDED"
+                : "STAGE_EXECUTION_FAILED",
+            "CUTOFF_SUPERSEDED".equals(failure.getMessage())
+                ? AnalysisFailure.Kind.PERMANENT
+                : AnalysisFailure.Kind.COMPUTATION);
+    }
+  }
+}
