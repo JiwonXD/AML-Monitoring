@@ -159,7 +159,7 @@ def _initialize(connection, execution, versions):
                                    (execution.run_id,)).fetchone()[0]
         recommended = getattr(registry.require(*versions["BINARY"]).spec, "RECOMMENDED_THRESHOLD", None)
         if first and recommended is not None:
-            # The suspicious threshold follows the bound binary model (user decision, 2026-10-17).
+            # The suspicious threshold follows the bound binary model (team decision, 2026-10-17).
             connection.execute("UPDATE analysis.jobs SET threshold_value=%s WHERE job_id=%s",
                                (recommended, execution.job_id))
         for kind in MODEL_KINDS:
